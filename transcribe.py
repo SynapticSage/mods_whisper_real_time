@@ -1,34 +1,33 @@
 #!/usr/bin/env python
 """
-Real-time speech transcription using OpenAI's Whisper model.
+Real-time speech transcription using OpenAI's Whisper or Faster Whisper.
 
 This script continuously listens to audio input from the microphone,
-transcribes it using the Whisper model, and displays the transcription
-in real-time. It supports various models, devices, and output formats.
+transcribes it using either the original Whisper model or Faster Whisper model,
+and displays the transcription in real-time.
 """
-
-from line_profiler import LineProfiler  # Used for performance profiling
 
 import argparse
 import os
 import numpy as np
-import speech_recognition as sr  # For microphone access and voice activity detection
-import whisper  # OpenAI's Whisper model for speech recognition
+import speech_recognition as sr
 import torch
 import threading
-
 from datetime import datetime, timedelta
-from queue import Queue  # Thread-safe queue for audio data
+import datetime as dt
+from queue import Queue
 from time import sleep
-from sys import platform  # Used for platform-specific microphone setup
-
+from sys import platform
 
 def main():
     # ========== COMMAND LINE ARGUMENT SETUP ==========
     parser = argparse.ArgumentParser()
-    # Model selection - controls accuracy vs. speed tradeoff
+    # Model and implementation selection
+    parser.add_argument("--fastwhisper", action="store_true",
+                        help="Use the Faster Whisper implementation instead of the original Whisper")
     parser.add_argument("--model", default="medium", help="Model to use",
-                        choices=["tiny", "base", "small", "medium", "large"])
+                        choices=["tiny", "base", "small", "medium", "large", "large-v2", "large-v3", 
+                                 "distil-medium", "distil-large", "distil-large-v2", "distil-large-v3"])
     # Language options
     parser.add_argument("--non_english", action='store_true',
                         help="Don't use the english model.")
@@ -40,13 +39,13 @@ def main():
     parser.add_argument("--phrase_timeout", default=3,
                         help="How much empty space between recordings before we "
                              "consider it a new line in the transcription.", type=float)
-    # Performance options
+    # Performance options (original Whisper only)
     parser.add_argument("--threads", default=4, type=int,
-                        help="Number of CPU threads to use for processing")
+                        help="Number of CPU threads to use for processing (original Whisper only)")
     parser.add_argument("--device", default="auto", choices=["cpu", "cuda", "auto"],
                         help="Device to use for inference (cpu, cuda, or auto for automatic detection)")
     parser.add_argument("--fp16", action="store_true",
-                        help="Use half-precision floating point for inference")
+                        help="Use half-precision floating point for inference (original Whisper only)")
     # Output options
     parser.add_argument("--out", type=str, metavar="FILE",
                         help="Output file to write transcription results")
@@ -89,10 +88,14 @@ def main():
             return
         else:
             # Search for the specified microphone by name
+            source = None
             for index, name in enumerate(sr.Microphone.list_microphone_names()):
                 if mic_name in name:
                     source = sr.Microphone(sample_rate=16000, device_index=index)
                     break
+            # Fallback to default if specified microphone not found
+            if source is None:
+                source = sr.Microphone(sample_rate=16000)
     else:
         # On non-Linux platforms, use the default microphone
         source = sr.Microphone(sample_rate=16000)  # 16kHz sample rate is optimal for Whisper
@@ -102,19 +105,46 @@ def main():
     model = args.model
     if args.model != "large" and not args.non_english:
         model = model + ".en"  # Use English-specific model for better accuracy on English speech
-        
-    # Determine the compute device (GPU or CPU)
-    device = args.device
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Optimize CPU usage if using CPU for inference
-    if device == "cpu":
-        torch.set_num_threads(args.threads)
+    # Load appropriate model based on implementation choice
+    audio_model = None
+    device = args.device
+    if args.fastwhisper:
+        # Import Faster Whisper implementation
+        from faster_whisper import WhisperModel
         
-    # Load the specified Whisper model
-    print(f"Loading {model} model...")
-    audio_model = whisper.load_model(model).to(device)
+        # Distilled models can use int8 quantization for better performance
+        compute_type = 'int8' if 'distil' in model else 'float16'
+        print(f"Loading Faster Whisper {model} model...")
+        
+        # Determine compute device
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # On Apple Silicon, force CPU with specific optimizations
+        if 'darwin' in platform and 'arm' in os.uname().machine:
+            device = "cpu"
+            
+        audio_model = WhisperModel(model, 
+                                  device=device,
+                                  compute_type=compute_type,
+                                  cpu_threads=args.threads,
+                                  num_workers=2)  # Use parallel processing
+    else:
+        # Import original Whisper implementation
+        import whisper
+        
+        # Determine the compute device (GPU or CPU)
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Optimize CPU usage if using CPU for inference
+        if device == "cpu":
+            torch.set_num_threads(args.threads)
+            
+        # Load the specified Whisper model
+        print(f"Loading original Whisper {model} model...")
+        audio_model = whisper.load_model(model).to(device)
 
     # Store parameters for recording and phrase detection
     record_timeout = args.record_timeout
@@ -126,7 +156,7 @@ def main():
     # Otherwise, it will be a list of text strings
     transcription = []
     if args.timestamp:
-        transcription.append((datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), "", 0.0))
+        transcription.append((datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M:%S"), "", 0.0))
     else:
         transcription.append("")
         
@@ -174,7 +204,7 @@ def main():
         
         while running:
             try:
-                now = datetime.utcnow()
+                now = datetime.now(dt.UTC)
                 # Check if we have audio data to process
                 if not data_queue.empty():
                     phrase_complete = False
@@ -207,15 +237,31 @@ def main():
                             initial_prompt = " ".join([entry for entry in context_entries if entry])
                     
                     # ===== TRANSCRIPTION =====
-                    # Process audio with Whisper model and measure performance
-                    start_time = datetime.utcnow()
-                    result = audio_model.transcribe(
-                        audio_np,
-                        fp16=args.fp16 or (device == "cuda"),  # Use FP16 on GPU
-                        initial_prompt=initial_prompt  # Provide context from previous transcriptions
-                    )
-                    proc_time = (datetime.utcnow() - start_time).total_seconds()
-                    text = result['text'].strip()
+                    # Process audio with appropriate Whisper model and measure performance
+                    start_time = datetime.now(dt.UTC)
+                    text = ""
+                    
+                    if args.fastwhisper:
+                        # Faster Whisper returns segments
+                        segments, info = audio_model.transcribe(
+                            audio_np, 
+                            beam_size=5,  # Smaller beam size is faster with minimal accuracy loss
+                            initial_prompt=initial_prompt,  # Provide context from previous transcriptions
+                            vad_filter=True,  # Filter out non-speech audio
+                            vad_parameters=dict(min_silence_duration_ms=500)  # Optimize VAD for real-time
+                        )
+                        # Join all segments into a single text string
+                        text = ''.join(segment.text for segment in segments).strip()
+                    else:
+                        # Original Whisper returns a dictionary with 'text' key
+                        result = audio_model.transcribe(
+                            audio_np,
+                            fp16=args.fp16 or (device == "cuda"),  # Use FP16 on GPU
+                            initial_prompt=initial_prompt  # Provide context from previous transcriptions
+                        )
+                        text = result['text'].strip()
+                        
+                    proc_time = (datetime.now(dt.UTC) - start_time).total_seconds()
 
                     # ===== RESULT HANDLING =====
                     # Handle output differently based on whether this is a new phrase or continuation
@@ -253,14 +299,26 @@ def main():
                             out_file.write(f"{text}\n")
                         out_file.flush()
 
-                    # Display current transcription in the terminal 
-                    # Use in-place update for continuous output
-                    # Note: This means some transcriptions might appear in the console but not be visible
-                    # at the end because they get overwritten. The file will capture all updates.
-                    print("\r" + display_text, end="", flush=True)
+                    # Display current transcription in the terminal
+                    if args.fastwhisper:
+                        # Clear screen and display full transcription (Faster Whisper style)
+                        os.system('cls' if os.name == 'nt' else 'clear')
+                        for line in transcription:
+                            if args.timestamp:
+                                ts, txt, pt = line
+                                if args.procdur:
+                                    print(f"{ts} ({pt:.2f}s) | {txt}")
+                                else:
+                                    print(f"{ts} | {txt}")
+                            else:
+                                print(line)
+                        print('', flush=True)
+                    else:
+                        # Use in-place update for continuous output (original Whisper style)
+                        print("\r" + display_text, end="", flush=True)
                 else:
                     # No audio data to process, sleep briefly to avoid CPU spinning
-                    sleep(1e-5)
+                    sleep(0.02)
             except Exception as e:
                 print(f"\nError in transcription thread: {e}")
                 break
@@ -271,15 +329,21 @@ def main():
     transcribe_thread.daemon = True  # Thread will terminate when the main program exits
     transcribe_thread.start()
     
+    # Show which options are being used for better traceability
+    model_type = "Faster Whisper" if args.fastwhisper else "Original Whisper"
+    print(f"Using {model_type} on {device} with {args.threads} threads")
+    if args.fastwhisper:
+        print(f"Optimizations: compute_type={compute_type}, beam_size=5, VAD filtering enabled")
+    
     # Main thread just waits for keyboard interrupt (Ctrl+C)
     try:
         while transcribe_thread.is_alive():
-            sleep(1e-5)
+            sleep(0.01)  # Reduced sleep time for faster responsiveness
     except KeyboardInterrupt:
         # Signal the transcription thread to stop
         running = False
         # Wait for transcription thread to finish (with timeout)
-        transcribe_thread.join(timeout=2.0)
+        transcribe_thread.join(timeout=1.0)
 
     # ========== FINAL OUTPUT ==========
     # Print the complete transcription at the end
@@ -302,15 +366,4 @@ def main():
 
 # ========== SCRIPT ENTRY POINT ==========
 if __name__ == "__main__":
-    # Setup line profiler for performance analysis
-    # profiler = LineProfiler()
-    try:
-        # profiler.add_function(main)
-        # profiler.add_function(transcribe_loop)  # Add the transcribe_loop to profiling
-        # profiler.enable_by_count()
-        main()
-    except Exception as e:
-        print(e)
-    # finally:
-        # Print profiling results at the end
-        # profiler.print_stats()
+    main()

@@ -8,3 +8,4 @@ git+https://github.com/openai/whisper.git
 faster-whisper
 ipython
 line_profiler
+soundfile
